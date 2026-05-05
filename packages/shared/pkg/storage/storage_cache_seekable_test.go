@@ -14,6 +14,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testCache returns a cachedSeekable with sensible test defaults.
+// inner is set to a mock that fails on any unexpected call — tests that
+// verify cache-only reads no longer need to nil out inner.
+func testCache(t *testing.T) cachedSeekable {
+	t.Helper()
+
+	return cachedSeekable{
+		path:      t.TempDir(),
+		chunkSize: 10,
+		inner:     NewMockSeekable(t),
+		tracer:    noopTracer,
+	}
+}
+
 // testReadAt emulates the removed cachedSeekable.ReadAt via OpenRangeReader.
 // This preserves the base test structure after ReadAt was removed from the Seekable interface.
 func testReadAt(ctx context.Context, c *cachedSeekable, buff []byte, off int64) (int, error) {
@@ -52,10 +66,9 @@ func TestCachedFileObjectProvider_Size(t *testing.T) {
 
 		const expectedSize int64 = 1024
 
-		inner := NewMockSeekable(t)
-		inner.EXPECT().Size(mock.Anything).Return(expectedSize, nil)
-
-		c := cachedSeekable{path: t.TempDir(), inner: inner, tracer: noopTracer}
+		c := testCache(t)
+		inner := c.inner.(*MockSeekable)
+		inner.EXPECT().Size(mock.Anything).Return(expectedSize, nil).Once()
 
 		// first call will write to cache
 		size, err := c.Size(t.Context())
@@ -94,7 +107,8 @@ func TestCachedFileObjectProvider_WriteFromFileSystem(t *testing.T) {
 		inner := NewMockSeekable(t)
 		inner.EXPECT().
 			StoreFile(mock.Anything, mock.Anything).
-			Return(nil, [32]byte{}, nil)
+			Return(nil, [32]byte{}, nil).
+			Once()
 
 		featureFlags := NewMockFeatureFlagsClient(t)
 		featureFlags.EXPECT().BoolFlag(mock.Anything, mock.Anything).Return(true)
@@ -109,9 +123,10 @@ func TestCachedFileObjectProvider_WriteFromFileSystem(t *testing.T) {
 		// file is written asynchronously, wait for it to finish
 		c.wg.Wait()
 
+		// Remaining reads should come from cache only.
 		c.inner = nil
+		c.flags = nil
 
-		// size should be cached
 		size, err := c.Size(t.Context())
 		require.NoError(t, err)
 		assert.Equal(t, int64(len(data)), size)
@@ -185,7 +200,7 @@ func TestCachedFileObjectProvider_WriteTo(t *testing.T) {
 				end := min(int(off)+int(length), len(fakeData))
 
 				return io.NopCloser(bytes.NewReader(fakeData[off:end])), nil
-			})
+			}).Once()
 
 		tempDir := t.TempDir()
 		c := cachedSeekable{
@@ -207,6 +222,7 @@ func TestCachedFileObjectProvider_WriteTo(t *testing.T) {
 
 		// second read pulls from cache
 		c.inner = nil // prevent remote reads, force cache read
+
 		buffer = make([]byte, 3)
 		read, err = testReadAt(t.Context(), &c, buffer, 3)
 		require.NoError(t, err)
@@ -516,6 +532,7 @@ func TestCachedSeekable_OpenRangeReader(t *testing.T) {
 
 		// Second call: should serve from NFS cache, inner not called again.
 		c.inner = nil
+
 		rc2, err := c.OpenRangeReader(t.Context(), 0, int64(len(data)), nil)
 		require.NoError(t, err)
 
@@ -625,7 +642,7 @@ func TestCacheWriteThroughReader(t *testing.T) {
 		data := []byte("hello")
 		inner := io.NopCloser(bytes.NewReader(data))
 
-		r := &cacheWriteThroughReader{
+		r := &cacheWritebackReader{
 			inner:       inner,
 			buf:         bytes.NewBuffer(make([]byte, 0, len(data))),
 			cache:       &c,
@@ -656,7 +673,7 @@ func TestCacheWriteThroughReader(t *testing.T) {
 		// the expected length so it must not be cached.
 		inner := io.NopCloser(bytes.NewReader([]byte{0xAA, 0xBB}))
 
-		r := &cacheWriteThroughReader{
+		r := &cacheWritebackReader{
 			inner:       inner,
 			buf:         bytes.NewBuffer(make([]byte, 0, 5)),
 			cache:       &c,
@@ -684,7 +701,7 @@ func TestCacheWriteThroughReader(t *testing.T) {
 		data := []byte("hello")
 		inner := io.NopCloser(bytes.NewReader(data))
 
-		r := &cacheWriteThroughReader{
+		r := &cacheWritebackReader{
 			inner:       inner,
 			buf:         bytes.NewBuffer(make([]byte, 0, len(data))),
 			cache:       &c,

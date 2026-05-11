@@ -199,9 +199,11 @@ func (u *Uffd) handle(ctx context.Context, sandboxId string, fdExit *fdexit.FdEx
 		}
 	}()
 
-	var memfd *block.Memfd
 	if len(fds) > 1 {
-		memfd = block.NewFromFd(fds[1])
+		memfd, err := block.NewFromFd(fds[1])
+		if err != nil {
+			return fmt.Errorf("failed to wrap memfd: %w", err)
+		}
 		u.memfd.Store(memfd)
 	}
 

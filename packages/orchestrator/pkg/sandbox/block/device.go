@@ -46,3 +46,17 @@ type Device interface {
 	io.WriterAt
 	WriteZeroesAt(off, length int64) (int, error)
 }
+
+// Cacher is the surface a paused-memory Cache exposes to the diff/upload
+// layer. Both *Cache and *MemfdCache implement it; the memfd-backed wrapper
+// additionally exposes Wait via type-assertion in callers that need to block
+// until the background copy finishes.
+type Cacher interface {
+	io.Closer
+	ReadAt(b []byte, off int64) (int, error)
+	Slice(off, length int64) ([]byte, error)
+	Size() (int64, error)
+	FileSize() (int64, error)
+	BlockSize() int64
+	Path() string
+}

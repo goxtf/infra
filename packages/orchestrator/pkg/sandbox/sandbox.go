@@ -1171,12 +1171,11 @@ func pauseProcessMemory(
 
 	header, err := diffMetadata.ToDiffHeader(ctx, originalHeader, buildID)
 	if err != nil {
-		var memfdErr error
 		if memfd != nil {
-			memfdErr = memfd.Close()
+			err = errors.Join(err, memfd.Close())
 		}
 
-		return nil, nil, errors.Join(fmt.Errorf("failed to create memfile header: %w", err), memfdErr)
+		return nil, nil, fmt.Errorf("failed to create memfile header: %w", err)
 	}
 
 	memfileDiffPath := build.GenerateDiffCachePath(cacheDir, buildID.String(), build.Memfile)

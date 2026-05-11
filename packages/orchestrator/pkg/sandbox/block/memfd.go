@@ -279,7 +279,13 @@ func (m *MemfdCache) Slice(off, length int64) ([]byte, error) {
 	if m.src != nil {
 		defer m.mu.RUnlock()
 
-		return m.src.slice(off, length)
+		srcSlice, err := m.src.slice(off, length)
+		if err != nil {
+			return nil, err
+		}
+		buf := make([]byte, len(srcSlice))
+		copy(buf, srcSlice)
+		return buf, nil
 	}
 	m.mu.RUnlock()
 

@@ -759,25 +759,26 @@ func BenchmarkCopyFromHugepagesFile(b *testing.B) {
 	}
 }
 
-// createTestMemfd creates a memfd of the given size, fills it with random data,
-// and registers a cleanup to close the fd. Returns the fd and the data written.
-func createTestMemfd(t *testing.T, size int64) (fd int, data []byte) {
+func createTestMemfd(t *testing.T, size int64) (*Memfd, []byte) {
 	t.Helper()
 
 	fd, err := unix.MemfdCreate("test", 0)
 	require.NoError(t, err)
-	t.Cleanup(func() { syscall.Close(fd) })
 
 	require.NoError(t, unix.Ftruncate(fd, size))
 
-	data = make([]byte, size)
+	data := make([]byte, size)
 	_, err = rand.Read(data)
 	require.NoError(t, err)
 
 	_, err = syscall.Pwrite(fd, data, 0)
 	require.NoError(t, err)
 
-	return fd, data
+	memfd, err := NewFromFd(fd)
+	require.NoError(t, err)
+	t.Cleanup(func() { memfd.Close() })
+
+	return memfd, data
 }
 
 func TestCopyFromMemfd_FullRange(t *testing.T) {
@@ -786,13 +787,13 @@ func TestCopyFromMemfd_FullRange(t *testing.T) {
 	pageSize := int64(header.PageSize)
 	size := pageSize * 30
 
-	fd, expected := createTestMemfd(t, size)
+	memfd, expected := createTestMemfd(t, size)
 
 	ranges := []Range{
 		{Start: 0, Size: size},
 	}
 
-	cache, err := NewCacheFromMemfd(t.Context(), pageSize, t.TempDir()+"/cache", NewFromFd(fd), ranges)
+	cache, err := NewCacheFromMemfd(t.Context(), pageSize, t.TempDir()+"/cache", memfd, ranges)
 	require.NoError(t, err)
 	t.Cleanup(func() { cache.Close() })
 
@@ -810,16 +811,15 @@ func TestCopyFromMemfd_MultipleRanges(t *testing.T) {
 	numPages := int64(6)
 	size := pageSize * numPages
 
-	fd, expected := createTestMemfd(t, size)
+	memfd, expected := createTestMemfd(t, size)
 
-	// Copy pages 0, 2, and 5 — non-contiguous, to verify cache offsets are packed correctly.
 	ranges := []Range{
 		{Start: 0, Size: pageSize},
 		{Start: pageSize * 2, Size: pageSize},
 		{Start: pageSize * 5, Size: pageSize},
 	}
 
-	cache, err := NewCacheFromMemfd(t.Context(), pageSize, t.TempDir()+"/cache", NewFromFd(fd), ranges)
+	cache, err := NewCacheFromMemfd(t.Context(), pageSize, t.TempDir()+"/cache", memfd, ranges)
 	require.NoError(t, err)
 	t.Cleanup(func() { cache.Close() })
 
@@ -844,15 +844,12 @@ func TestCopyFromMemfd_MultipleRanges(t *testing.T) {
 func TestExportMemoryFromMemfd_DirtyBitmap(t *testing.T) {
 	t.Parallel()
 
-	// Simulate the exportMemoryFromMemfd path: a dirty-page bitmap drives which
-	// ranges are read from the memfd, exactly as ExportMemory does at runtime.
 	pageSize := int64(header.PageSize)
 	numPages := int64(8)
 	size := pageSize * numPages
 
-	fd, expected := createTestMemfd(t, size)
+	memfd, expected := createTestMemfd(t, size)
 
-	// Mark pages 1, 2, and 6 as dirty.
 	dirty := roaring.New()
 	dirty.Add(1)
 	dirty.Add(2)
@@ -863,18 +860,16 @@ func TestExportMemoryFromMemfd_DirtyBitmap(t *testing.T) {
 		ranges = append(ranges, r)
 	}
 
-	cache, err := NewCacheFromMemfd(t.Context(), pageSize, t.TempDir()+"/cache", NewFromFd(fd), ranges)
+	cache, err := NewCacheFromMemfd(t.Context(), pageSize, t.TempDir()+"/cache", memfd, ranges)
 	require.NoError(t, err)
 	t.Cleanup(func() { cache.Close() })
 
-	// BitsetRanges merges contiguous pages: pages 1 and 2 become one range,
-	// page 6 is separate. Verify each landed at the correct cache offset.
 	cases := []struct {
 		cacheOffset int64
 		srcOffset   int64
 		size        int64
 	}{
-		{0, pageSize * 1, pageSize * 2}, // pages 1–2 merged
+		{0, pageSize * 1, pageSize * 2},
 		{pageSize * 2, pageSize * 6, pageSize},
 	}
 
@@ -885,4 +880,31 @@ func TestExportMemoryFromMemfd_DirtyBitmap(t *testing.T) {
 		require.Equal(t, int(tc.size), n)
 		require.NoError(t, compareData(got, expected[tc.srcOffset:tc.srcOffset+tc.size]))
 	}
+}
+
+func TestCopyFromMemfd_BackgroundCopyWritesFile(t *testing.T) {
+	t.Parallel()
+
+	pageSize := int64(header.PageSize)
+	size := pageSize * 12
+
+	memfd, expected := createTestMemfd(t, size)
+	ranges := []Range{{Start: 0, Size: size}}
+
+	cachePath := t.TempDir() + "/cache"
+	cache, err := NewCacheFromMemfd(t.Context(), pageSize, cachePath, memfd, ranges)
+	require.NoError(t, err)
+	t.Cleanup(func() { cache.Close() })
+
+	require.NoError(t, cache.Wait(t.Context()))
+
+	got := make([]byte, size)
+	n, err := cache.ReadAt(got, 0)
+	require.NoError(t, err)
+	require.Equal(t, int(size), n)
+	require.NoError(t, compareData(got, expected))
+
+	fromFile, err := os.ReadFile(cachePath)
+	require.NoError(t, err)
+	require.NoError(t, compareData(fromFile, expected))
 }

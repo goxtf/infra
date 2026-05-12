@@ -27,6 +27,29 @@ struct uffd_remove {
 	__u64 start;
 	__u64 end;
 };
+
+#ifndef UFFD_FEATURE_MINOR_HUGETLBFS
+#define UFFD_FEATURE_MINOR_HUGETLBFS (1 << 9)
+#endif
+
+#ifndef UFFD_FEATURE_MINOR_SHMEM
+#define UFFD_FEATURE_MINOR_SHMEM (1 << 10)
+#endif
+
+#ifndef UFFDIO_REGISTER_MODE_MINOR
+#define UFFDIO_REGISTER_MODE_MINOR ((__u64)1 << 1)
+#endif
+
+#ifndef UFFDIO_CONTINUE
+#define _UFFDIO_CONTINUE 0x07
+#define UFFDIO_CONTINUE _IOWR(0xAA, _UFFDIO_CONTINUE, struct uffdio_continue)
+
+struct uffdio_continue {
+	struct uffdio_range range;
+	__u64 mode;
+	__s64 mapped;
+};
+#endif
 */
 import "C"
 
@@ -46,6 +69,7 @@ const (
 
 	UFFDIO_REGISTER_MODE_MISSING = C.UFFDIO_REGISTER_MODE_MISSING
 	UFFDIO_REGISTER_MODE_WP      = C.UFFDIO_REGISTER_MODE_WP
+	UFFDIO_REGISTER_MODE_MINOR   = C.UFFDIO_REGISTER_MODE_MINOR
 
 	UFFDIO_COPY_MODE_WP = C.UFFDIO_COPY_MODE_WP
 
@@ -60,6 +84,7 @@ const (
 	UFFDIO_ZEROPAGE     = C.UFFDIO_ZEROPAGE
 	UFFDIO_WRITEPROTECT = C.UFFDIO_WRITEPROTECT
 	UFFDIO_WAKE         = C.UFFDIO_WAKE
+	UFFDIO_CONTINUE     = C.UFFDIO_CONTINUE
 
 	UFFD_PAGEFAULT_FLAG_WRITE = C.UFFD_PAGEFAULT_FLAG_WRITE
 	UFFD_PAGEFAULT_FLAG_MINOR = C.UFFD_PAGEFAULT_FLAG_MINOR
@@ -68,6 +93,8 @@ const (
 	UFFD_FEATURE_MISSING_HUGETLBFS = C.UFFD_FEATURE_MISSING_HUGETLBFS
 	UFFD_FEATURE_EVENT_REMOVE      = C.UFFD_FEATURE_EVENT_REMOVE
 	UFFD_FEATURE_WP_ASYNC          = C.UFFD_FEATURE_WP_ASYNC
+	UFFD_FEATURE_MINOR_HUGETLBFS   = C.UFFD_FEATURE_MINOR_HUGETLBFS
+	UFFD_FEATURE_MINOR_SHMEM       = C.UFFD_FEATURE_MINOR_SHMEM
 )
 
 type (
@@ -85,6 +112,7 @@ type (
 	UffdioCopy         = C.struct_uffdio_copy
 	UffdioZero         = C.struct_uffdio_zeropage
 	UffdioWriteProtect = C.struct_uffdio_writeprotect
+	UffdioContinue     = C.struct_uffdio_continue
 )
 
 func newUffdioAPI(api, features CULong) UffdioAPI {
@@ -128,6 +156,13 @@ func newUffdioZero(address, pagesize, mode CULong) UffdioZero {
 
 func newUffdioWriteProtect(address, pagesize, mode CULong) UffdioWriteProtect {
 	return UffdioWriteProtect{
+		_range: newUffdioRange(address, pagesize),
+		mode:   mode,
+	}
+}
+
+func newUffdioContinue(address, pagesize, mode CULong) UffdioContinue {
+	return UffdioContinue{
 		_range: newUffdioRange(address, pagesize),
 		mode:   mode,
 	}
@@ -196,6 +231,28 @@ func (f Fd) writeProtect(addr, pagesize uintptr, mode CULong) error {
 
 	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(f), UFFDIO_WRITEPROTECT, uintptr(unsafe.Pointer(&writeProtect))); errno != 0 {
 		return errno
+	}
+
+	return nil
+}
+
+// continue installs into the VMA a page that is already present in the
+// underlying file (memfd) backing. Resolves MINOR faults zero-copy: the
+// kernel only updates the page-table entry for this VMA, no memcpy.
+// Requires the VMA to be file-backed (hugetlbfs or shmem) and the UFFD
+// to have been opened with UFFD_FEATURE_MINOR_HUGETLBFS / _SHMEM.
+func (f Fd) continueIoctl(addr, pagesize uintptr) error {
+	c := newUffdioContinue(CULong(addr)&^CULong(pagesize-1), CULong(pagesize), 0)
+
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(f), UFFDIO_CONTINUE, uintptr(unsafe.Pointer(&c))); errno != 0 {
+		return errno
+	}
+
+	if c.mapped < 0 {
+		return syscall.Errno(-c.mapped)
+	}
+	if c.mapped != CLong(pagesize) {
+		return fmt.Errorf("UFFDIO_CONTINUE installed %d bytes, expected %d", c.mapped, pagesize)
 	}
 
 	return nil

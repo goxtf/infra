@@ -26,23 +26,6 @@ func NewAuthStore(authDB *authdb.Client) *AuthStoreImpl {
 	return &AuthStoreImpl{authDB: authDB}
 }
 
-func validateTeamUsage(team authqueries.Team) error {
-	if team.IsBanned {
-		return &TeamForbiddenError{Message: "team is banned"}
-	}
-
-	if team.IsBlocked {
-		msg := "team is blocked"
-		if team.BlockedReason != nil && *team.BlockedReason != "" {
-			msg = fmt.Sprintf("%s: %s", msg, *team.BlockedReason)
-		}
-
-		return &TeamBlockedError{Message: msg}
-	}
-
-	return nil
-}
-
 func (s *AuthStoreImpl) GetTeamByHashedAPIKey(ctx context.Context, hashedKey string) (*types.Team, error) {
 	ctx, span := tracer.Start(ctx, "get team auth")
 	defer span.End()
@@ -50,11 +33,6 @@ func (s *AuthStoreImpl) GetTeamByHashedAPIKey(ctx context.Context, hashedKey str
 	result, err := s.authDB.Read.GetTeamWithTierByAPIKey(ctx, hashedKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get team from API key: %w", err)
-	}
-
-	err = validateTeamUsage(result.Team)
-	if err != nil {
-		return nil, err
 	}
 
 	go func() {
@@ -80,11 +58,6 @@ func (s *AuthStoreImpl) GetTeamByID(ctx context.Context, teamID uuid.UUID) (*typ
 		return nil, fmt.Errorf("failed to get team from team ID: %w", err)
 	}
 
-	err = validateTeamUsage(result.Team)
-	if err != nil {
-		return nil, err
-	}
-
 	team := types.NewTeam(&result.Team, &result.TeamLimit)
 
 	return team, nil
@@ -105,11 +78,6 @@ func (s *AuthStoreImpl) GetTeamByIDAndUserID(ctx context.Context, userID uuid.UU
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get team from teamID and userID key: %w", err)
-	}
-
-	err = validateTeamUsage(result.Team)
-	if err != nil {
-		return nil, err
 	}
 
 	team := types.NewTeam(&result.Team, &result.TeamLimit)

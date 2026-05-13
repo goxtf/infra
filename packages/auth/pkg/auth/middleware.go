@@ -99,16 +99,6 @@ func (a *CommonAuthenticator[T]) Authenticate(ctx context.Context, ginCtx *gin.C
 
 		ginCtx.Status(validationError.Code)
 
-		var forbiddenError *TeamForbiddenError
-		if errors.As(validationError.Err, &forbiddenError) {
-			return fmt.Errorf("forbidden: %w", validationError.Err)
-		}
-
-		var blockedError *TeamBlockedError
-		if errors.As(validationError.Err, &blockedError) {
-			return fmt.Errorf("blocked: %w", validationError.Err)
-		}
-
 		return fmt.Errorf("%s\n%s (%w)", a.ErrorMessage, validationError.ClientMsg, validationError.Err)
 	}
 

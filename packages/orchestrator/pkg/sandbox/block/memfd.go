@@ -3,15 +3,22 @@
 package block
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"syscall"
 
+	"github.com/RoaringBitmap/roaring/v2"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 )
 
 // Memfd wraps a memfd received from Firecracker
@@ -90,6 +97,160 @@ type MemfdCache struct {
 	memfd *Memfd
 }
 
+func writeAll(fd int, off int64, buff []byte) error {
+	remaining := len(buff)
+	buffOff := 0
+
+	for remaining > 0 {
+		n, err := unix.Pwrite(fd, buff[buffOff:], off)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+
+		if err != nil {
+			return err
+		}
+
+		if n == 0 {
+			return fmt.Errorf("pwrite: EOF with %d bytes remaining", remaining)
+		}
+
+		remaining -= n
+		buffOff += n
+		off += int64(n)
+	}
+
+	return nil
+}
+
+func dedupRange(
+	ctx context.Context,
+	originalMemfile ReadonlyDevice,
+	f *os.File,
+	off int64,
+	blockSize int64,
+	pageDirty *roaring.Bitmap,
+	memfd *Memfd,
+	r *Range,
+	buff []byte,
+) (int64, error) {
+	for chunkOff := int64(0); chunkOff < r.Size; chunkOff += blockSize {
+		select {
+		case <-ctx.Done():
+			return off, ctx.Err()
+		default:
+		}
+
+		srcBuf, err := memfd.Slice(r.Start+chunkOff, blockSize)
+		if err != nil {
+			return off, err
+		}
+
+		_, err = originalMemfile.ReadAt(ctx, buff, r.Start+chunkOff)
+		if err != nil {
+			return off, fmt.Errorf("failed to read original memfile at offset %d: %w", r.Start+chunkOff, err)
+		}
+
+		for i := int64(0); i < blockSize; i += header.PageSize {
+			if bytes.Equal(srcBuf[i:i+header.PageSize], buff[i:i+header.PageSize]) {
+				continue
+			}
+
+			pageIdx := uint32((r.Start + chunkOff + i) / header.PageSize)
+			pageDirty.Add(pageIdx)
+			if err = writeAll(int(f.Fd()), off, srcBuf[i:i+header.PageSize]); err != nil {
+				return off, err
+			}
+
+			off += header.PageSize
+		}
+	}
+
+	return off, nil
+}
+
+func NewCacheFromMemfdDeduped(
+	ctx context.Context,
+	originalMemfile ReadonlyDevice,
+	blockSize int64,
+	filePath string,
+	memfd *Memfd,
+	ranges []Range,
+) (*MemfdCache, *header.DiffMetadata, error) {
+	ctx, span := tracer.Start(ctx, "new-cache-from-memfd-deduped")
+	defer span.End()
+
+	f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return nil, nil, errors.Join(fmt.Errorf("error opening cache file: %w", err), memfd.Close())
+	}
+
+	var fileOff int64
+	pageDirty := roaring.NewBitmap()
+	buff := make([]byte, blockSize)
+	var exportedSize int64
+	for _, r := range ranges {
+		exportedSize += r.Size
+		fileOff, err = dedupRange(ctx, originalMemfile, f, fileOff, blockSize, pageDirty, memfd, &r, buff)
+		if err != nil {
+			return nil, nil, errors.Join(err, f.Close(), memfd.Close(), os.Remove(filePath))
+		}
+	}
+
+	if err = f.Close(); err != nil {
+		return nil, nil, errors.Join(err, memfd.Close(), os.Remove(filePath))
+	}
+
+	cache, err := NewCache(fileOff, header.PageSize, filePath, false)
+	if err != nil {
+		return nil, nil, errors.Join(err, memfd.Close(), os.Remove(filePath))
+	}
+	cache.setIsCached(0, fileOff)
+
+	// All source bytes are on disk in `cache`; the memfd is no longer needed.
+	// Release the mmap (and on hugetlbfs the reservation) eagerly so we
+	// don't pin host memory for the lifetime of the MemfdCache.
+	if err = memfd.Close(); err != nil {
+		logger.L().Warn(ctx, "Could not close memfd after dedup", zap.Error(err))
+	}
+
+	totalPages := exportedSize / header.PageSize
+	uniquePages := int64(pageDirty.GetCardinality())
+	dedupedPages := totalPages - uniquePages
+
+	telemetry.SetAttributes(
+		ctx,
+		attribute.Int64("dedup.total_pages", totalPages),
+		attribute.Int64("dedup.deduped_pages", dedupedPages),
+		attribute.Int64("dedup.unique_pages", uniquePages),
+		attribute.Float64("dedup.ratio", safeDivide(float64(dedupedPages), float64(totalPages))),
+	)
+
+	logger.L().Info(ctx, "4KiB page dedup completed (memfd fast-path)",
+		zap.Int("ranges", len(ranges)),
+		zap.Int64("total_4k_pages", totalPages),
+		zap.Int64("deduped_pages", dedupedPages),
+		zap.Int64("unique_pages", uniquePages),
+		zap.Int64("exported_size_bytes", exportedSize),
+		zap.Int64("dedup_size_bytes", fileOff),
+		zap.String("reduction", fmt.Sprintf("%.1f%%", safeDivide(float64(dedupedPages), float64(totalPages))*100)),
+	)
+
+	return &MemfdCache{cache: cache}, &header.DiffMetadata{
+		Dirty:     pageDirty,
+		Empty:     roaring.New(),
+		BlockSize: header.PageSize,
+	}, nil
+}
+
+func safeDivide(a, b float64) float64 {
+	if b == 0 {
+		return 0
+	}
+
+	return a / b
+}
+
 func NewCacheFromMemfd(
 	ctx context.Context,
 	blockSize int64,
@@ -97,6 +258,9 @@ func NewCacheFromMemfd(
 	memfd *Memfd,
 	ranges []Range,
 ) (*MemfdCache, error) {
+	ctx, span := tracer.Start(ctx, "new-cache-from-memfd")
+	defer span.End()
+
 	size := GetSize(ranges)
 
 	cache, err := NewCache(size, blockSize, filePath, false)

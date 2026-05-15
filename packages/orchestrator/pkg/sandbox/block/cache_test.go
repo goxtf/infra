@@ -1153,3 +1153,48 @@ func TestCacheDedup_OriginalMemfileReadError(t *testing.T) {
 	)
 	require.ErrorIs(t, err, sentinel)
 }
+
+// Pages that match the base and happen to be all-zero must be recorded in
+// Empty (so the merged header maps them to uuid.Nil → zero-fill at read),
+// rather than relying on a fall-through to the parent's diff. Non-zero
+// matches must stay unmapped so the merge keeps the parent's real mapping.
+func TestCacheDedup_ZeroMatchingPagesGoIntoEmpty(t *testing.T) {
+	t.Parallel()
+
+	pageSize := int64(header.PageSize)
+	blockSize := 4 * pageSize
+	size := blockSize * 2 // 8 pages
+
+	// Base: pages 0..3 zero, pages 4..7 random non-zero.
+	origData := make([]byte, size)
+	_, err := rand.Read(origData[4*pageSize:])
+	require.NoError(t, err)
+
+	// Source matches base exactly — no Dirty pages.
+	srcData := make([]byte, size)
+	copy(srcData, origData)
+
+	dirty := allBlocksDirty(uint32(size / blockSize))
+	src := buildPackedSrcCache(t, srcData, dirty, blockSize)
+
+	cache, meta, err := src.Dedup(
+		t.Context(),
+		&fakeOriginalDevice{data: origData},
+		dirty,
+		blockSize,
+		t.TempDir()+"/dedup",
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cache.Close() })
+
+	require.EqualValues(t, 0, meta.Dirty.GetCardinality(), "no pages differ from base")
+
+	// Only the zero pages (0..3) should be in Empty.
+	require.EqualValues(t, 4, meta.Empty.GetCardinality())
+	for i := uint32(0); i < 4; i++ {
+		require.True(t, meta.Empty.Contains(i), "zero-matching page %d should be in Empty", i)
+	}
+	for i := uint32(4); i < 8; i++ {
+		require.False(t, meta.Empty.Contains(i), "non-zero-matching page %d should not be in Empty", i)
+	}
+}

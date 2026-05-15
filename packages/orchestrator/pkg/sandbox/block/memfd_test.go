@@ -759,3 +759,54 @@ func TestNewCacheFromMemfdDeduped_CloseRemovesCacheFile(t *testing.T) {
 	_, err = os.Stat(cachePath)
 	require.ErrorIs(t, err, os.ErrNotExist, "cache file should be removed after Close")
 }
+
+// Pages that match the base and happen to be all-zero must be recorded in
+// Empty (so the merged header maps them to uuid.Nil → zero-fill at read),
+// rather than relying on a fall-through to the parent's diff — which for
+// the synthetic Empty template has no real backing file and would error.
+//
+// Non-zero pages that match the base must NOT land in Empty (those rely on
+// the merged mapping keeping the parent's mapping pointing at the real
+// parent diff).
+func TestNewCacheFromMemfdDeduped_ZeroMatchingPagesGoIntoEmpty(t *testing.T) {
+	t.Parallel()
+
+	pageSize := int64(header.PageSize)
+	blockSize := 4 * pageSize
+	size := blockSize * 2 // 8 pages
+
+	// Base: pages 0..3 zero, pages 4..7 random non-zero.
+	origData := make([]byte, size)
+	_, err := rand.Read(origData[4*pageSize:])
+	require.NoError(t, err)
+
+	// Memfd matches base exactly — no Dirty pages, but the first half
+	// matches a *zero* base and the second half matches a *non-zero* base.
+	srcData := make([]byte, size)
+	copy(srcData, origData)
+
+	fd := newTestMemfdWith(t, srcData)
+	memfd := NewFromFd(fd, int(size))
+
+	cache, meta, err := NewCacheFromMemfdDeduped(
+		t.Context(),
+		&fakeOriginalDevice{data: origData},
+		blockSize,
+		t.TempDir()+"/dedup",
+		memfd,
+		[]Range{{Start: 0, Size: size}},
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cache.Close() })
+
+	require.EqualValues(t, 0, meta.Dirty.GetCardinality(), "no pages differ from base")
+
+	// Only the zero pages (0..3) should be in Empty.
+	require.EqualValues(t, 4, meta.Empty.GetCardinality())
+	for i := uint32(0); i < 4; i++ {
+		require.True(t, meta.Empty.Contains(i), "zero-matching page %d should be in Empty", i)
+	}
+	for i := uint32(4); i < 8; i++ {
+		require.False(t, meta.Empty.Contains(i), "non-zero-matching page %d should not be in Empty", i)
+	}
+}

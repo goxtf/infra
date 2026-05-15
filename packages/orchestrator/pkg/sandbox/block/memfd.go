@@ -129,7 +129,7 @@ func dedupRange(
 	f *os.File,
 	off int64,
 	blockSize int64,
-	pageDirty *roaring.Bitmap,
+	pageDirty, pageEmpty *roaring.Bitmap,
 	memfd *Memfd,
 	r *Range,
 	buff []byte,
@@ -152,13 +152,25 @@ func dedupRange(
 		}
 
 		for i := int64(0); i < blockSize; i += header.PageSize {
-			if bytes.Equal(srcBuf[i:i+header.PageSize], buff[i:i+header.PageSize]) {
+			srcPage := srcBuf[i : i+header.PageSize]
+			pageIdx := uint32((r.Start + chunkOff + i) / header.PageSize)
+
+			if bytes.Equal(srcPage, buff[i:i+header.PageSize]) {
+				// Page matches base. If it's all-zero, mark it as Empty so
+				// the merged header emits a uuid.Nil mapping for it — the
+				// read path serves zero locally instead of falling through
+				// to the parent's diff (which may be the synthetic Empty
+				// template with no real backing). Non-zero matches stay
+				// unmapped so the merge keeps the parent mapping.
+				if header.IsZero(srcPage) {
+					pageEmpty.Add(pageIdx)
+				}
+
 				continue
 			}
 
-			pageIdx := uint32((r.Start + chunkOff + i) / header.PageSize)
 			pageDirty.Add(pageIdx)
-			if err = writeAll(int(f.Fd()), off, srcBuf[i:i+header.PageSize]); err != nil {
+			if err = writeAll(int(f.Fd()), off, srcPage); err != nil {
 				return off, err
 			}
 
@@ -187,11 +199,12 @@ func NewCacheFromMemfdDeduped(
 
 	var fileOff int64
 	pageDirty := roaring.NewBitmap()
+	pageEmpty := roaring.NewBitmap()
 	buff := make([]byte, blockSize)
 	var exportedSize int64
 	for _, r := range ranges {
 		exportedSize += r.Size
-		fileOff, err = dedupRange(ctx, originalMemfile, f, fileOff, blockSize, pageDirty, memfd, &r, buff)
+		fileOff, err = dedupRange(ctx, originalMemfile, f, fileOff, blockSize, pageDirty, pageEmpty, memfd, &r, buff)
 		if err != nil {
 			return nil, nil, errors.Join(err, f.Close(), memfd.Close(), os.Remove(filePath))
 		}
@@ -238,7 +251,7 @@ func NewCacheFromMemfdDeduped(
 
 	return &MemfdCache{cache: cache}, &header.DiffMetadata{
 		Dirty:     pageDirty,
-		Empty:     roaring.New(),
+		Empty:     pageEmpty,
 		BlockSize: header.PageSize,
 	}, nil
 }

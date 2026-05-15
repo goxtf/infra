@@ -236,6 +236,7 @@ func (c *Cache) Dedup(
 	}
 
 	pageDirty := roaring.New()
+	pageEmpty := roaring.New()
 	srcBuf := make([]byte, blockSize)
 	baseBuf := make([]byte, blockSize)
 
@@ -266,13 +267,26 @@ func (c *Cache) Dedup(
 			}
 
 			for i := int64(0); i < blockSize; i += header.PageSize {
-				if bytes.Equal(srcBuf[i:i+header.PageSize], baseBuf[i:i+header.PageSize]) {
+				srcPage := srcBuf[i : i+header.PageSize]
+				pageIdx := uint32((r.Start + chunkOff + i) / header.PageSize)
+
+				if bytes.Equal(srcPage, baseBuf[i:i+header.PageSize]) {
+					// Page matches base. If it's all-zero, mark it as Empty
+					// so the merged header emits a uuid.Nil mapping for it —
+					// the read path serves zero locally instead of falling
+					// through to the parent's diff (which may be the
+					// synthetic Empty template with no real backing).
+					// Non-zero matches stay unmapped so the merge keeps the
+					// parent mapping and reads from the parent.
+					if header.IsZero(srcPage) {
+						pageEmpty.Add(pageIdx)
+					}
+
 					continue
 				}
 
-				pageIdx := uint32((r.Start + chunkOff + i) / header.PageSize)
 				pageDirty.Add(pageIdx)
-				if err := writeAll(int(f.Fd()), fileOff, srcBuf[i:i+header.PageSize]); err != nil {
+				if err := writeAll(int(f.Fd()), fileOff, srcPage); err != nil {
 					return nil, nil, errors.Join(err, f.Close(), os.Remove(outPath))
 				}
 				fileOff += header.PageSize
@@ -315,7 +329,7 @@ func (c *Cache) Dedup(
 
 	return dedupCache, &header.DiffMetadata{
 		Dirty:     pageDirty,
-		Empty:     roaring.New(),
+		Empty:     pageEmpty,
 		BlockSize: header.PageSize,
 	}, nil
 }

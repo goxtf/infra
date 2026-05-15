@@ -1236,11 +1236,27 @@ func pauseProcessMemory(
 
 	// When dedup ran, the diff layout is page-granular; otherwise keep the
 	// pre-export diff metadata.
+	//
+	// Empty bits in the original metadata cover pages the guest zeroed that
+	// were not part of Dirty — Dedup never sees them, so dedupMeta.Empty
+	// only carries zero-pages-that-matched-base. Without re-keying and
+	// unioning the original Empty into dedupMeta.Empty, those pages would
+	// have no diff mapping on restore and would fall through to the
+	// parent's (potentially non-zero) content instead of reading as zero.
 	if dedupMeta != nil {
+		if diffMetadata.BlockSize%dedupMeta.BlockSize != 0 {
+			return nil, nil, errors.Join(
+				fmt.Errorf("diff block size %d not a multiple of dedup block size %d",
+					diffMetadata.BlockSize, dedupMeta.BlockSize),
+				cache.Close(),
+			)
+		}
+		ratio := uint64(diffMetadata.BlockSize / dedupMeta.BlockSize)
+		dedupMeta.Empty.Or(header.UpsampleBitmap(diffMetadata.Empty, ratio))
 		diffMetadata = dedupMeta
 	}
 
-	header, err := diffMetadata.ToDiffHeader(ctx, originalHeader, buildID)
+	diffHeader, err := diffMetadata.ToDiffHeader(ctx, originalHeader, buildID)
 	if err != nil {
 		return nil, nil, errors.Join(fmt.Errorf("failed to create memfile header: %w", err), cache.Close())
 	}
@@ -1254,7 +1270,7 @@ func pauseProcessMemory(
 		return nil, nil, fmt.Errorf("failed to create local diff from cache: %w", errors.Join(err, cache.Close()))
 	}
 
-	return diff, header, nil
+	return diff, diffHeader, nil
 }
 
 func pauseProcessRootfs(

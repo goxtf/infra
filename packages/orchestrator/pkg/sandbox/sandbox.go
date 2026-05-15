@@ -1127,7 +1127,13 @@ func (s *Sandbox) Pause(
 	}
 	recordSnapshotDiff(ctx, "memfile", memfileDiffMetadata, originalMemfile.Header(), useCase)
 
-	// Start POSTPROCESSING
+	// Start POSTPROCESSING.
+	// When the dedup flag is on we pass the base memfile so pauseProcessMemory
+	// can drop pages that match the base byte-for-byte; otherwise nil disables dedup.
+	var dedupBase block.ReadonlyDevice
+	if s.featureFlags.BoolFlag(ctx, featureflags.MemfileDiffDedupFlag) {
+		dedupBase = originalMemfile
+	}
 	memfileDiff, memfileDiffHeader, err := pauseProcessMemory(
 		ctx,
 		buildID,
@@ -1136,6 +1142,7 @@ func (s *Sandbox) Pause(
 		s.config.DefaultCacheDir,
 		s.process,
 		s.memory.Memfd(ctx),
+		dedupBase,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error while post processing: %w", err)
@@ -1196,6 +1203,11 @@ func (s *Sandbox) MemoryPrefetchData(ctx context.Context) (block.PrefetchData, e
 	return prefetchData, nil
 }
 
+// pauseProcessMemory exports the dirty guest memory to a local diff cache.
+// When originalMemfile is non-nil, the exported diff is deduplicated at
+// 4 KiB-page granularity against the base template's memfile: pages that
+// match the base byte-for-byte are dropped, and the returned DiffHeader is
+// rebuilt at page granularity.
 func pauseProcessMemory(
 	ctx context.Context,
 	buildID uuid.UUID,
@@ -1204,31 +1216,33 @@ func pauseProcessMemory(
 	cacheDir string,
 	fc *fc.Process,
 	memfd *block.Memfd,
+	originalMemfile block.ReadonlyDevice,
 ) (d build.Diff, h *header.Header, e error) {
 	ctx, span := tracer.Start(ctx, "process-memory")
 	defer span.End()
 
-	header, err := diffMetadata.ToDiffHeader(ctx, originalHeader, buildID)
-	if err != nil {
-		var closeErr error
-		if memfd != nil {
-			closeErr = memfd.Close()
-		}
-
-		return nil, nil, errors.Join(fmt.Errorf("failed to create memfile header: %w", err), closeErr)
-	}
-
-	memfileDiffPath := build.GenerateDiffCachePath(cacheDir, buildID.String(), build.Memfile)
-
-	cache, err := fc.ExportMemory(
+	cache, dedupMeta, err := fc.ExportMemory(
 		ctx,
+		buildID,
 		diffMetadata.Dirty,
-		memfileDiffPath,
+		cacheDir,
 		diffMetadata.BlockSize,
 		memfd,
+		originalMemfile,
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to export memory: %w", err)
+	}
+
+	// When dedup ran, the diff layout is page-granular; otherwise keep the
+	// pre-export diff metadata.
+	if dedupMeta != nil {
+		diffMetadata = dedupMeta
+	}
+
+	header, err := diffMetadata.ToDiffHeader(ctx, originalHeader, buildID)
+	if err != nil {
+		return nil, nil, errors.Join(fmt.Errorf("failed to create memfile header: %w", err), cache.Close())
 	}
 
 	diff, err := build.NewLocalDiffFromCache(

@@ -47,6 +47,10 @@ test:
 test-short:
 	$(GO) test -short $(GO_TEST_FLAGS) ./...
 
+## test-verbose: Run all tests with verbose output (useful for debugging)
+test-verbose:
+	$(GO) test -v $(GO_TEST_FLAGS) ./...
+
 ## lint: Run golangci-lint
 lint:
 	@which golangci-lint > /dev/null || (echo "golangci-lint not found, install from https://golangci-lint.run" && exit 1)

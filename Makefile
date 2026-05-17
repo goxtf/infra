@@ -78,6 +78,10 @@ dev:
 dev-down:
 	$(DOCKER_COMPOSE) down
 
+## dev-logs: Tail logs from local development environment
+dev-logs:
+	$(DOCKER_COMPOSE) logs -f
+
 ## deploy-gcp: Deploy infrastructure to GCP
 deploy-gcp:
 	@test -f .env.gcp || (echo ".env.gcp not found, copy from .env.gcp.template" && exit 1)

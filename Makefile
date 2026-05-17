@@ -111,3 +111,9 @@ check: fmt vet lint test
 
 ## ci: Run CI pipeline steps
 ci: tidy generate build vet test
+
+## watch-test: Re-run tests on file changes (requires entr: brew install entr)
+# Handy for TDD workflows locally
+watch-test:
+	@which entr > /dev/null || (echo "entr not found, install with: brew install entr" && exit 1)
+	find . -name '*.go' | entr -c $(GO) test $(GO_TEST_FLAGS) ./...

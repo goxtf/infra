@@ -1,223 +1,104 @@
-ENV := $(shell cat .last_used_env || echo "not-set")
-ENV_FILE := .env.${ENV}
-PROVIDER ?= gcp
+# Makefile for e2b-dev/infra fork
+# Provides common development, build, and deployment targets
 
--include ${ENV_FILE}
+.PHONY: help build test lint fmt clean dev deploy-gcp deploy-aws
 
-AWS_BUCKET_PREFIX ?= $(PREFIX)$(AWS_ACCOUNT_ID)-
-GCP_BUCKET_PREFIX ?= $(GCP_PROJECT_ID)-
+# Default target
+.DEFAULT_GOAL := help
 
-.PHONY: provider-login
-provider-login:
-	$(MAKE) -C iac/provider-$(PROVIDER) provider-login
-
-.PHONY: init
-init:
-	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
-	$(MAKE) -C iac/provider-$(PROVIDER) init
-
-# Setup production environment variables, this is used only for E2B.dev production
-# Uses Infisical CLI to read secrets from Infisical Vault
-# To update them, use the Infisical UI directly
-# On a first use, you need to run `infisical login` and `infisical init`
-.PHONY: download-prod-env
-download-prod-env:
-	@  ./scripts/download-prod-env.sh ${ENV}
-
-.PHONY: plan
-plan:
-	$(MAKE) -C iac/provider-$(PROVIDER) plan
-
-# Deploy all jobs in Nomad
-.PHONY: plan-only-jobs
-plan-only-jobs:
-	$(MAKE) -C iac/provider-$(PROVIDER) plan-only-jobs
-
-# Deploy a specific job name in Nomad
-# When job name is specified, all '-' are replaced with '_' in the job name
-.PHONY: plan-only-jobs/%
-plan-only-jobs/%:
-	$(MAKE) -C iac/provider-$(PROVIDER) plan-only-jobs/$(subst -,_,$(notdir $@))
-
-.PHONY: plan-without-jobs
-plan-without-jobs:
-	$(MAKE) -C iac/provider-$(PROVIDER) plan-without-jobs
-
-.PHONY: state-migrate
-state-migrate:
-	$(MAKE) -C iac/provider-$(PROVIDER) state-migrate
-
-.PHONY: apply-init
-apply-init:
-	$(MAKE) -C iac/provider-$(PROVIDER) apply-init
-
-.PHONY: apply
-apply:
-	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
-	$(MAKE) -C iac/provider-$(PROVIDER) apply
-
-# Shortcut to importing resources into Terraform state (e.g. after creating resources manually or switching between different branches for the same environment)
-.PHONY: import
-import:
-	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
-	$(MAKE) -C iac/provider-$(PROVIDER) import
-
-# Shortcut to moving resources in Terraform state
-.PHONY: move
-move:
-	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
-	$(MAKE) -C iac/provider-$(PROVIDER) move
-
-.PHONY: version
-version:
-	./scripts/increment-version.sh
-
-.PHONY: build
-build/%:
-	$(MAKE) -C packages/$(notdir $@) build
-
-.PHONY: build-and-upload
-build-and-upload:build-and-upload/api
-build-and-upload:build-and-upload/client-proxy
-build-and-upload:build-and-upload/dashboard-api
-build-and-upload:build-and-upload/docker-reverse-proxy
-build-and-upload:build-and-upload/clean-nfs-cache
-build-and-upload:build-and-upload/orchestrator
-build-and-upload:build-and-upload/template-manager
-build-and-upload:build-and-upload/envd
-build-and-upload:build-and-upload/clickhouse-migrator
-build-and-upload:build-and-upload/nomad-nodepool-apm
-build-and-upload/clean-nfs-cache:
-	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
-	GCP_PROJECT_ID=$(GCP_PROJECT_ID) $(MAKE) -C packages/orchestrator build-and-upload/clean-nfs-cache
-build-and-upload/template-manager:
-	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
-	GCP_PROJECT_ID=$(GCP_PROJECT_ID) $(MAKE) -C packages/orchestrator build-and-upload/template-manager
-build-and-upload/orchestrator:
-	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
-	GCP_PROJECT_ID=$(GCP_PROJECT_ID) $(MAKE) -C packages/orchestrator build-and-upload/orchestrator
-build-and-upload/clickhouse-migrator:
-	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
-	GCP_PROJECT_ID=$(GCP_PROJECT_ID) $(MAKE) -C packages/clickhouse build-and-upload
-build-and-upload/%:
-	./scripts/confirm.sh $(TERRAFORM_ENVIRONMENT)
-	GCP_PROJECT_ID=$(GCP_PROJECT_ID) $(MAKE) -C packages/$(notdir $@) build-and-upload
-
-.PHONY: copy-public-builds
-copy-public-builds:
-ifeq ($(PROVIDER),aws)
-	mkdir -p ./.kernels
-	mkdir -p ./.firecrackers
-	mkdir -p ./.busybox
-	aws s3 cp s3://e2b-prod-public-builds/kernels/ ./.kernels/ --recursive --no-sign-request --endpoint-url https://storage.googleapis.com
-	aws s3 cp s3://e2b-prod-public-builds/firecrackers/ ./.firecrackers/ --recursive --no-sign-request --endpoint-url https://storage.googleapis.com
-	aws s3 cp s3://e2b-prod-public-builds/busybox/ ./.busybox/ --recursive --no-sign-request --endpoint-url https://storage.googleapis.com
-	aws s3 cp ./.kernels/ s3://${AWS_BUCKET_PREFIX}fc-kernels/ --recursive --profile ${AWS_PROFILE}
-	aws s3 cp ./.firecrackers/ s3://${AWS_BUCKET_PREFIX}fc-versions/ --recursive --profile ${AWS_PROFILE}
-	aws s3 cp ./.busybox/ s3://${AWS_BUCKET_PREFIX}fc-busybox/ --recursive --profile ${AWS_PROFILE}
-	rm -rf ./.kernels
-	rm -rf ./.firecrackers
-	rm -rf ./.busybox
-else
-	gsutil cp -r gs://e2b-prod-public-builds/kernels/* gs://$(GCP_BUCKET_PREFIX)fc-kernels/
-	gsutil cp -r gs://e2b-prod-public-builds/firecrackers/* gs://$(GCP_BUCKET_PREFIX)fc-versions/
-	gsutil cp -r gs://e2b-prod-public-builds/busybox/* gs://$(GCP_BUCKET_PREFIX)fc-busybox/
+# Load environment variables if .envrc exists
+ifneq (,$(wildcard .envrc))
+  include .envrc
+  export
 endif
 
-.PHONY: download-public-kernels
-download-public-kernels:
-	mkdir -p ./packages/fc-kernels
-	gsutil cp -r gs://e2b-prod-public-builds/kernels/* ./packages/fc-kernels/
+# Go settings
+GO := go
+GOFLAGS := -v
+GO_BUILD_FLAGS := -ldflags "-s -w"
+GO_TEST_FLAGS := -race -timeout 120s
 
-.PHONY: download-public-firecrackers
-download-public-firecrackers:
-	mkdir -p ./packages/fc-versions/builds/
-	gsutil -m cp -r gs://e2b-prod-public-builds/firecrackers/* ./packages/fc-versions/builds/
-	find ./packages/fc-versions/builds/ -name firecracker -exec chmod +x {} \;
+# Docker settings
+DOCKER := docker
+DOCKER_COMPOSE := docker compose
 
-.PHONY: generate
-generate: generate/api generate/orchestrator generate/client-proxy generate/envd generate/db generate/shared generate-tests generate-mocks
-generate/%:
-	@echo "Generating code for *$(notdir $@)*"
-	$(MAKE) -C packages/$(notdir $@) generate
-	@printf "\n\n"
+# Directories
+CMD_DIR := ./cmd
+PKG_DIR := ./pkg
+INFRA_DIR := ./infra
 
-.PHONY: generate-tests
-generate-tests: generate-tests/integration
-generate-tests/%:
-	@echo "Generating code for *$(notdir $@)*"
-	$(MAKE) -C tests/$(notdir $@) generate
-	@printf "\n\n"
+## help: Show this help message
+help:
+	@echo "Usage: make [target]"
+	@echo ""
+	@echo "Targets:"
+	@sed -n 's/^## //p' $(MAKEFILE_LIST) | column -t -s ':' | sed -e 's/^/  /'
 
-.PHONY: migrate
-migrate:
-	$(MAKE) -C packages/db migrate
+## build: Build all Go binaries
+build:
+	$(GO) build $(GO_BUILD_FLAGS) $(GOFLAGS) ./...
 
-.PHONY: prep-cluster
-prep-cluster:
-	$(MAKE) -C packages/shared prep-cluster
-
-.PHONY: seed-db
-seed-db:
-	$(MAKE) -C packages/db seed-db
-
-.PHONY: set-env
-set-env:
-	@ touch .last_used_env
-	@ echo $(ENV) > .last_used_env
-	@ . ./${ENV_FILE}
-
-.PHONY: switch-env
-switch-env:
-	@ printf "Switching from `tput setaf 1``tput bold`$(shell cat .last_used_env)`tput sgr0` to `tput setaf 2``tput bold`$(ENV)`tput sgr0`\n\n"
-	$(MAKE) set-env ENV=$(ENV)
-	make -C iac/provider-$(PROVIDER) switch
-
-.PHONY: setup-ssh
-setup-ssh:
-	@ printf "Setting up SSH for env: `tput setaf 2``tput bold`$(ENV)`tput sgr0`\n"
-	@ gcloud compute config-ssh --remove
-	@ gcloud compute config-ssh --project $(GCP_PROJECT_ID) --quiet
-	@ printf "SSH setup complete\n"
-
-.PHONY: test
+## test: Run all tests
 test:
-	go work edit -json \
-		| jq -r '.Use[] | select (.DiskPath | contains("packages")) | .DiskPath' \
-		| xargs -I{} $(MAKE) -C {} test
+	$(GO) test $(GO_TEST_FLAGS) ./...
 
-.PHONY: test-integration
-test-integration:
-	$(MAKE) -C tests/integration test
+## test-short: Run short tests only
+test-short:
+	$(GO) test -short $(GO_TEST_FLAGS) ./...
 
-.PHONY: connect-orchestrator
-connect-orchestrator:
-	$(MAKE) -C tests/integration connect-orchestrator
-
-.PHONY: fmt
-fmt:
-	golangci-lint fmt
-	terraform fmt -recursive
-
-.PHONY: lint
+## lint: Run golangci-lint
 lint:
-	go work edit -json | jq -r '.Use[].DiskPath' | xargs -P 4 -I{} golangci-lint run {}/... --fix
+	@which golangci-lint > /dev/null || (echo "golangci-lint not found, install from https://golangci-lint.run" && exit 1)
+	golangci-lint run ./...
 
-.PHONY: generate-mocks
-generate-mocks:
-	GOOS=linux mockery
+## fmt: Format Go source files
+fmt:
+	$(GO) fmt ./...
+	goimports -w .
 
-.PHONY: tidy
+## vet: Run go vet
+vet:
+	$(GO) vet ./...
+
+## tidy: Tidy go modules
 tidy:
-	@scripts/golang-dependencies-integrity.sh
+	$(GO) mod tidy
 
-.PHONY: local-infra
-local-infra:
-	$(MAKE) -C packages/local-dev local-infra
+## clean: Remove build artifacts
+clean:
+	@rm -rf ./bin ./dist
+	$(GO) clean ./...
 
-.PHONY: gcloud-ingress-dashboard
-gcloud-ingress-dashboard:
-ifndef INSTANCE
-	$(error usage: make gcloud-ingress-dashboard INSTANCE=<instance>)
-endif
-	gcloud compute ssh $(INSTANCE) -- -NL 8900:localhost:8900
+## dev: Start local development environment
+dev:
+	$(DOCKER_COMPOSE) up --build
+
+## dev-down: Stop local development environment
+dev-down:
+	$(DOCKER_COMPOSE) down
+
+## deploy-gcp: Deploy infrastructure to GCP
+deploy-gcp:
+	@test -f .env.gcp || (echo ".env.gcp not found, copy from .env.gcp.template" && exit 1)
+	@echo "Deploying to GCP..."
+	cd $(INFRA_DIR) && terraform init && terraform apply -var-file=gcp.tfvars
+
+## deploy-aws: Deploy infrastructure to AWS
+deploy-aws:
+	@test -f .env.aws || (echo ".env.aws not found, copy from .env.aws.template" && exit 1)
+	@echo "Deploying to AWS..."
+	cd $(INFRA_DIR) && terraform init && terraform apply -var-file=aws.tfvars
+
+## docker-build: Build all Docker images
+docker-build:
+	$(DOCKER) build -t infra:latest .
+
+## generate: Run go generate
+generate:
+	$(GO) generate ./...
+
+## check: Run all checks (fmt, vet, lint, test)
+check: fmt vet lint test
+
+## ci: Run CI pipeline steps
+ci: tidy generate build vet test

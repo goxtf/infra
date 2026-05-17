@@ -16,7 +16,8 @@ endif
 GO := go
 GOFLAGS := -v
 GO_BUILD_FLAGS := -ldflags "-s -w"
-GO_TEST_FLAGS := -race -timeout 120s
+# Reduced timeout from 120s to 60s for faster feedback during local dev
+GO_TEST_FLAGS := -race -timeout 60s
 
 # Docker settings
 DOCKER := docker
